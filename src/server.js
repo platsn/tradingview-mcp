@@ -47,7 +47,10 @@ Changing the chart:
 - indicator_set_inputs → change indicator settings (length, source, etc.)
 
 Pine Script development:
-- pine_set_source → inject code, pine_smart_compile → compile + check errors
+- pine_set_source → inject code, pine_smart_compile → request compile and inspect diagnostics
+- Treat compilation_status=unverified as UNKNOWN, not success or a reason to keep compiling. Inspect the chart/console.
+- pine_compile and pine_smart_compile never infer completion from a click, marker silence, or study counts.
+- Source code and chart output returned by tools enter the AI client context; pine_check sends source to TradingView.
 - pine_get_errors → read errors, pine_get_console → read log output
 - WARNING: pine_get_source can return 200KB+ for complex scripts — avoid unless editing
 
@@ -56,7 +59,7 @@ Replay: replay_start → replay_step → replay_trade → replay_status → repl
 Batch: batch_run → run action across multiple symbols/timeframes
 Drawing: draw_shape → horizontal_line, trend_line, rectangle, text
 Alerts: alert_create, alert_list, alert_delete
-Launch: tv_launch → auto-detect and start TradingView with CDP on any platform
+Launch: tv_launch → reuse CDP or start TradingView; existing processes are preserved unless kill_existing=true is explicitly requested
 Panes: pane_list, pane_set_layout (s, 2h, 2v, 4, 6, 8), pane_focus, pane_set_symbol
 Tabs: tab_list, tab_new, tab_close, tab_switch
 

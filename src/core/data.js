@@ -3,6 +3,7 @@
  */
 import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.js';
 import { waitForChartReady } from '../wait.js';
+import { sanitizeIndicatorInputs } from './input-sanitizer.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
@@ -181,8 +182,8 @@ export async function getOhlcv({ count, summary } = {}) {
   return { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
 }
 
-export async function getIndicator({ entity_id }) {
-  const data = await evaluate(`
+export async function getIndicator({ entity_id, _deps }) {
+  const data = await (_deps?.evaluate || evaluate)(`
     (function() {
       var api = ${CHART_API};
       var study = api.getStudyById(${safeString(entity_id)});
@@ -196,14 +197,7 @@ export async function getIndicator({ entity_id }) {
 
   if (data?.error) throw new Error(data.error);
 
-  let inputs = data?.inputs;
-  if (Array.isArray(inputs)) {
-    inputs = inputs.filter(inp => {
-      if (inp.id === 'text' && typeof inp.value === 'string' && inp.value.length > 200) return false;
-      if (typeof inp.value === 'string' && inp.value.length > 500) return false;
-      return true;
-    });
-  }
+  const inputs = sanitizeIndicatorInputs(data?.inputs);
   return { success: true, entity_id, visible: data?.visible, inputs };
 }
 
@@ -493,8 +487,8 @@ export async function getDepth() {
   return { success: true, bid_levels: data.bids?.length || 0, ask_levels: data.asks?.length || 0, spread: data.spread, bids: data.bids || [], asks: data.asks || [], raw_values: data.raw_values, note: data.note };
 }
 
-export async function getStudyValues() {
-  const data = await evaluate(`
+export async function getStudyValues({ _deps } = {}) {
+  const data = await (_deps?.evaluate || evaluate)(`
     (function() {
       var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
       var model = chart.model();
@@ -532,7 +526,8 @@ export async function getStudyValues() {
       return results;
     })()
   `);
-  return { success: true, study_count: data?.length || 0, studies: data || [] };
+  const studies = (data || []).map(study => ({ ...study, inputs: sanitizeIndicatorInputs(study.inputs) }));
+  return { success: true, study_count: studies.length, studies };
 }
 
 export async function getPineLines({ study_filter, verbose } = {}) {

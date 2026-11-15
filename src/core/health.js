@@ -4,7 +4,7 @@
 import { getClient, getTargetInfo, evaluate, CDP_HOST, CDP_PORT } from '../connection.js';
 import { existsSync, cpSync, rmSync, readdirSync } from 'fs';
 import { execSync, spawn } from 'child_process';
-import { dirname, basename, join } from 'path';
+import { win32 } from 'path';
 
 // Best-effort git-pull update check: compare local HEAD to origin's default
 // branch on GitHub. Never throws — returns null on any failure (offline,
@@ -211,6 +211,8 @@ function _resolveLaunchDeps(deps) {
     readdirSync: deps?.readdirSync || readdirSync,
     delay: deps?.delay || ((ms) => new Promise((r) => setTimeout(r, ms))),
     probeCdp: deps?.probeCdp || _probeCdp,
+    platform: deps?.platform || process.platform,
+    spawnFailedEarly: deps?.spawnFailedEarly || _spawnFailedEarly,
   };
 }
 
@@ -229,6 +231,8 @@ async function _probeCdp(cdpPort) {
 
 function _spawnDetached(spawnFn, exe, args) {
   const child = spawnFn(exe, args, { detached: true, stdio: 'ignore' });
+  // Keep late spawn errors from becoming uncaught events after startup checks.
+  child.on('error', () => {});
   child.unref();
   return child;
 }
@@ -251,7 +255,8 @@ async function _waitForCdp({ cdpPort, attempts, delay, probeCdp }) {
     await delay(1000);
     try {
       const ready = await probeCdp(cdpPort);
-      if (ready) return JSON.parse(ready);
+      const info = ready ? JSON.parse(ready) : null;
+      if (info?.Browser) return info;
     } catch { /* retry */ }
   }
   return null;
@@ -265,16 +270,16 @@ async function _waitForCdp({ cdpPort, attempts, delay, probeCdp }) {
  * so copy the package into LOCALAPPDATA once per version and launch that.
  */
 function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync }) {
-  const srcDir = dirname(tvPath);
-  const pkgName = basename(srcDir);
-  const cacheRoot = join(process.env.LOCALAPPDATA || '', 'tradingview-mcp');
-  const dstDir = join(cacheRoot, pkgName);
-  const dstExe = join(dstDir, 'TradingView.exe');
+  const srcDir = win32.dirname(tvPath);
+  const pkgName = win32.basename(srcDir);
+  const cacheRoot = win32.join(process.env.LOCALAPPDATA || '', 'tradingview-mcp');
+  const dstDir = win32.join(cacheRoot, pkgName);
+  const dstExe = win32.join(dstDir, 'TradingView.exe');
   if (!existsSync(dstExe)) {
     try {
       for (const entry of readdirSync(cacheRoot)) {
         if (entry !== pkgName && /^TradingView\./i.test(entry)) {
-          rmSync(join(cacheRoot, entry), { recursive: true, force: true });
+          rmSync(win32.join(cacheRoot, entry), { recursive: true, force: true });
         }
       }
     } catch { /* cache root may not exist yet */ }
@@ -285,9 +290,25 @@ function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync
 
 export async function launch({ port, kill_existing, _deps } = {}) {
   const deps = _resolveLaunchDeps(_deps);
-  const cdpPort = port || CDP_PORT;
-  const killFirst = kill_existing !== false;
-  const platform = process.platform;
+  const cdpPort = port ?? CDP_PORT;
+  if (!Number.isInteger(cdpPort) || cdpPort < 1 || cdpPort > 65535) throw new Error('Invalid CDP port');
+  if (kill_existing !== undefined && typeof kill_existing !== 'boolean') throw new Error('kill_existing must be a boolean');
+  const killFirst = kill_existing === true;
+  const platform = deps.platform;
+
+  // Reuse a healthy debugging endpoint before looking for an executable or
+  // touching existing processes. Restart only when explicitly requested.
+  if (!killFirst) {
+    try {
+      const ready = await deps.probeCdp(cdpPort);
+      const existing = ready ? JSON.parse(ready) : null;
+      if (existing?.Browser) return {
+        success: true, already_running: true, cdp_ready: true, platform,
+        cdp_port: cdpPort, cdp_url: `http://${CDP_HOST}:${cdpPort}`,
+        browser: existing.Browser, user_agent: existing['User-Agent'],
+      };
+    } catch { /* not ready — continue with a non-destructive launch */ }
+  }
 
   const pathMap = {
     darwin: [
@@ -360,33 +381,34 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   if (killFirst) await killExisting();
 
   const cdpArgs = [`--remote-debugging-port=${cdpPort}`];
-  let child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
-  let info = null;
+  let child = null;
+  let launchError = null;
   let usedLocalCopy = false;
-
-  if (platform === 'win32' && WINDOWS_APPS_RE.test(tvPath)) {
-    const earlyFailure = await _spawnFailedEarly(child);
-    if (!earlyFailure) {
-      info = await _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
+  const startAndProbe = async (exe) => {
+    try {
+      child = _spawnDetached(deps.spawn, exe, cdpArgs);
+      launchError = await deps.spawnFailedEarly(child);
+    } catch (err) {
+      launchError = err.code || err.message;
+      child = null;
     }
-    if (!info) {
-      // Direct WindowsApps launch was blocked or CDP never bound — fall back to
-      // a local copy of the package (see _copyMsixPackageLocal).
-      const localExe = _copyMsixPackageLocal(tvPath, deps);
-      await killExisting();
-      child = _spawnDetached(deps.spawn, localExe, cdpArgs);
-      tvPath = localExe;
-      usedLocalCopy = true;
-    }
-  }
+    if (launchError) return null;
+    return _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
+  };
 
-  if (!info) {
-    info = await _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
+  let info = await startAndProbe(tvPath);
+  if (!info && platform === 'win32' && WINDOWS_APPS_RE.test(tvPath)) {
+    // A synchronous EPERM/EACCES must reach the same fallback as an early exit.
+    const localExe = _copyMsixPackageLocal(tvPath, deps);
+    if (killFirst) await killExisting();
+    tvPath = localExe;
+    usedLocalCopy = true;
+    info = await startAndProbe(tvPath);
   }
 
   if (info) {
     return {
-      success: true, platform, binary: tvPath, pid: child.pid,
+      success: true, cdp_ready: true, platform, binary: tvPath, pid: child?.pid,
       cdp_port: cdpPort, cdp_url: `http://${CDP_HOST}:${cdpPort}`,
       browser: info.Browser, user_agent: info['User-Agent'],
       ...(usedLocalCopy && { msix_local_copy: true }),
@@ -394,8 +416,9 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   }
 
   return {
-    success: true, platform, binary: tvPath, pid: child.pid, cdp_port: cdpPort, cdp_ready: false,
+    success: false, platform, binary: tvPath, pid: child?.pid, cdp_port: cdpPort, cdp_ready: false,
     ...(usedLocalCopy && { msix_local_copy: true }),
-    warning: 'TradingView launched but CDP not responding yet. It may still be loading. Try tv_health_check in a few seconds.',
+    error: launchError ? `TradingView failed to start: ${launchError}` : 'TradingView did not expose a CDP endpoint before the startup timeout.',
+    hint: 'Save your work and close TradingView manually before retrying, or explicitly request kill_existing: true. Check tv_health_check after launch. No sandbox-disabling flags are added.',
   };
 }
