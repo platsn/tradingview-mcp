@@ -7,7 +7,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, execSync } from 'child_process';
+import { execFileSync, execSync, spawnSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { writeFileSync, unlinkSync } from 'fs';
@@ -16,6 +16,16 @@ function require_fs() { return { writeFileSync, unlinkSync }; }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLI = join(__dirname, '..', 'src', 'cli', 'index.js');
+
+it('CLI uses a nonzero exit code for a structured tool failure', () => {
+  const routerUrl = new URL('../src/cli/router.js', import.meta.url).href;
+  const script = `import { register, run } from ${JSON.stringify(routerUrl)};
+    register('probe', { handler: async () => ({ success: false, error: 'not ready' }) });
+    await run(['node', 'tv', 'probe']);`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf-8' });
+  assert.equal(result.status, 1);
+  assert.equal(JSON.parse(result.stdout).success, false);
+});
 
 function run(args, opts = {}) {
   try {
@@ -129,7 +139,7 @@ describe('CLI — pine analyze (offline)', () => {
   });
 });
 
-describe('CLI — pine check (server compile)', () => {
+describe('CLI — pine check (server compile)', { skip: process.env.TV_MCP_LIVE_TESTS !== '1' }, () => {
   it('compiles valid Pine Script', () => {
     const source = '//@version=6\nindicator("test")\nplot(close)';
     const { stdout, exitCode } = run(['pine', 'check'], { input: source });
@@ -142,7 +152,7 @@ describe('CLI — pine check (server compile)', () => {
   it('returns errors for invalid Pine Script', () => {
     const source = '//@version=6\nindicator("test")\nplot(nonexistent_var)';
     const { stdout, exitCode } = run(['pine', 'check'], { input: source });
-    assert.equal(exitCode, 0);
+    assert.equal(exitCode, 1);
     const result = JSON.parse(stdout);
     assert.equal(result.compiled, false);
     assert.ok(result.error_count > 0);

@@ -6,10 +6,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { win32 } from 'node:path';
 import { launch } from '../src/core/health.js';
 
 const MSIX_EXE = 'C:\\Program Files\\WindowsApps\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\\TradingView.exe';
-const LOCAL_COPY_EXE = `${process.env.LOCALAPPDATA || ''}\\tradingview-mcp\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\\TradingView.exe`;
+const LOCAL_COPY_EXE = win32.join(process.env.LOCALAPPDATA || '', 'tradingview-mcp', 'TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj', 'TradingView.exe');
 const CDP_VERSION = JSON.stringify({ Browser: 'Chrome/140', 'User-Agent': 'TVDesktop/3.1.0' });
 
 // ── Mock helpers ─────────────────────────────────────────────────────────
@@ -17,6 +18,7 @@ const CDP_VERSION = JSON.stringify({ Browser: 'Chrome/140', 'User-Agent': 'TVDes
 function mockChild({ failWith } = {}) {
   const child = new EventEmitter();
   child.pid = 12345;
+  child.startError = failWith || null;
   child.unref = () => {};
   if (failWith) queueMicrotask(() => child.emit('error', Object.assign(new Error(failWith), { code: failWith })));
   return child;
@@ -29,9 +31,11 @@ function mockChild({ failWith } = {}) {
  *   cdpBindsFor  — spawn paths (substring) after which probeCdp starts succeeding
  *   copyExists   — local copy already present
  */
-function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false } = {}) {
+function msixDeps({ spawnFailures = [], spawnThrows = [], cdpBindsFor = [], copyExists = false } = {}) {
   const state = { spawned: [], copies: [], removed: [], killed: 0, cdpUp: false };
   const deps = {
+    platform: 'win32',
+    spawnFailedEarly: async child => child.startError,
     existsSync: (p) => {
       if (p === MSIX_EXE) return true;
       if (p.includes('tradingview-mcp')) return copyExists || state.copies.length > 0;
@@ -46,6 +50,7 @@ function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false } =
     },
     spawn: (exe) => {
       state.spawned.push(exe);
+      if (spawnThrows.some(s => exe.includes(s))) throw Object.assign(new Error('blocked'), { code: 'EPERM' });
       const fail = spawnFailures.some((s) => exe.includes(s));
       if (!fail && cdpBindsFor.some((s) => exe.includes(s))) state.cdpUp = true;
       return mockChild(fail ? { failWith: 'EACCES' } : {});
@@ -59,10 +64,9 @@ function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false } =
   return { deps, state };
 }
 
-// launch() only takes the MSIX code path on win32; skip elsewhere.
-const onWindows = process.platform === 'win32';
+// Inject the platform so Windows failure paths run on every test host.
 
-describe('launch() — MSIX WindowsApps handling', { skip: !onWindows }, () => {
+describe('launch() — MSIX WindowsApps handling', () => {
   it('direct WindowsApps spawn that binds CDP does not copy', async () => {
     const { deps, state } = msixDeps({ cdpBindsFor: ['WindowsApps'] });
     const result = await launch({ _deps: deps });
@@ -84,8 +88,8 @@ describe('launch() — MSIX WindowsApps handling', { skip: !onWindows }, () => {
     // stale cached version of another release is cleaned up first
     assert.equal(state.removed.length, 1);
     assert.match(state.removed[0], /3\.0\.0\.7652/);
-    // the CDP-less direct instance is killed before relaunching from the copy
-    assert.ok(state.killed >= 2);
+    // No existing session is killed, including during the fallback.
+    assert.equal(state.killed, 0);
   });
 
   it('CDP never binding on direct spawn falls back to local copy', async () => {
@@ -106,21 +110,23 @@ describe('launch() — MSIX WindowsApps handling', { skip: !onWindows }, () => {
     assert.equal(state.copies.length, 0);
   });
 
-  it('returns cdp_ready:false warning when nothing binds', async () => {
+  it('reports failure when CDP never binds', async () => {
     const { deps } = msixDeps({});
     const result = await launch({ _deps: deps });
-    assert.equal(result.success, true);
+    assert.equal(result.success, false);
     assert.equal(result.cdp_ready, false);
     assert.equal(result.msix_local_copy, true);
-    assert.ok(result.warning);
+    assert.ok(result.error);
   });
 });
 
-describe('launch() — classic install path', { skip: !onWindows }, () => {
+describe('launch() — classic install path', () => {
   it('launches classic LOCALAPPDATA install without MSIX logic', async () => {
     const classicExe = `${process.env.LOCALAPPDATA}\\TradingView\\TradingView.exe`;
     const state = { spawned: [], cdpUp: false };
     const deps = {
+    platform: 'win32',
+    spawnFailedEarly: async child => child.startError,
       existsSync: (p) => p === classicExe,
       execSync: (cmd) => { if (cmd.includes('taskkill')) return ''; throw new Error(`unexpected: ${cmd}`); },
       spawn: (exe) => { state.spawned.push(exe); state.cdpUp = true; return mockChild(); },
@@ -139,6 +145,8 @@ describe('launch() — classic install path', { skip: !onWindows }, () => {
 
   it('throws a helpful error when TradingView is not found', async () => {
     const deps = {
+    platform: 'win32',
+    spawnFailedEarly: async child => child.startError,
       existsSync: () => false,
       execSync: () => { throw new Error('not found'); },
       spawn: () => { throw new Error('should not spawn'); },
@@ -146,5 +154,62 @@ describe('launch() — classic install path', { skip: !onWindows }, () => {
       delay: async () => {}, probeCdp: async () => null,
     };
     await assert.rejects(() => launch({ _deps: deps }), /TradingView not found/);
+  });
+});
+
+
+describe('launch() — session protection and failures', () => {
+  it('reuses healthy CDP without finding, spawning, copying, or killing an app', async () => {
+    const { deps, state } = msixDeps();
+    state.cdpUp = true;
+    deps.existsSync = () => { throw new Error('must not inspect install paths'); };
+    const result = await launch({ _deps: deps });
+    assert.equal(result.already_running, true);
+    assert.equal(result.cdp_ready, true);
+    assert.equal(state.killed, 0);
+    assert.deepEqual(state.spawned, []);
+    assert.deepEqual(state.copies, []);
+  });
+
+  it('only force-closes existing processes for an explicit restart', async () => {
+    const { deps, state } = msixDeps({ spawnFailures: ['WindowsApps'], cdpBindsFor: ['tradingview-mcp'] });
+    const result = await launch({ kill_existing: true, _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(state.killed, 2);
+  });
+
+  it('routes a synchronous Windows EPERM through the local-copy fallback', async () => {
+    const { deps, state } = msixDeps({ spawnThrows: ['WindowsApps'], cdpBindsFor: ['tradingview-mcp'] });
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.msix_local_copy, true);
+    assert.equal(state.spawned.length, 2);
+    assert.equal(state.killed, 0);
+  });
+
+  it('reports a failed local-copy spawn without throwing an uncaught error', async () => {
+    const { deps, state } = msixDeps({ spawnThrows: ['WindowsApps', 'tradingview-mcp'] });
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, false);
+    assert.match(result.error, /EPERM/);
+    assert.equal(state.killed, 0);
+  });
+
+  it('does not accept an unrelated JSON response as a ready CDP server', async () => {
+    const { deps } = msixDeps();
+    deps.probeCdp = async () => '{}';
+    assert.equal((await launch({ _deps: deps })).success, false);
+  });
+
+  it('rejects unsafe argument types before probing or touching a process', async () => {
+    const { deps, state } = msixDeps();
+    for (const kill_existing of ['false', 'true', 1, null]) {
+      await assert.rejects(() => launch({ kill_existing, _deps: deps }), /boolean/);
+    }
+    for (const port of [0, -1, 70000, 9222.5, '9222']) {
+      await assert.rejects(() => launch({ port, _deps: deps }), /port/);
+    }
+    assert.equal(state.killed, 0);
+    assert.equal(state.spawned.length, 0);
   });
 });

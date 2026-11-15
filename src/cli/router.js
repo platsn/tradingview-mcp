@@ -132,7 +132,7 @@ async function execute(handler, values, positionals) {
   try {
     const result = await handler(values, positionals);
     console.log(JSON.stringify(result, null, 2));
-    process.exit(0);
+    process.exit(result?.success === false ? 1 : 0);
   } catch (err) {
     handleError(err);
   }

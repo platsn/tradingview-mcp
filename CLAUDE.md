@@ -43,7 +43,7 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 
 ### "Work on Pine Script"
 1. `pine_set_source` → inject code into editor
-2. `pine_smart_compile` → compile with auto-detection + error check
+2. `pine_smart_compile` → request compilation and inspect diagnostics; `compilation_status: unverified` is not success and should not trigger blind retries
 3. `pine_get_errors` → read compilation errors
 4. `pine_get_console` → read log.info() output
 5. `pine_get_source` → read current code back (WARNING: can be very large for complex scripts)
@@ -112,7 +112,10 @@ These tools can return large payloads. Follow these rules to avoid context bloat
 
 ## Tool Conventions
 
-- All tools return `{ success: true/false, ... }`
+- All tools return `{ success: true/false, ... }`. Compile tools distinguish dispatch from completion. An empty marker list, changed study count, or button click does not verify compilation. Inspect the chart and console for `unverified` results.
+- Launch preserves existing processes by default. Use `kill_existing: true` only for an explicitly requested restart after work is saved.
+- Boolean parameters require JSON booleans, not strings.
+- On `ptgambler-dev`, update the pinned checkout deliberately; `tv_update` only supports `main`.
 - Entity IDs (from `chart_get_state`) are session-specific — don't cache across sessions
 - Pine indicators must be **visible** on chart for pine graphics tools to read their data
 - `chart_manage_indicator` requires **full indicator names**: "Relative Strength Index" not "RSI", "Moving Average Exponential" not "EMA", "Bollinger Bands" not "BB"

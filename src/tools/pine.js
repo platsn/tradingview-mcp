@@ -15,13 +15,13 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_compile', 'Compile / add the current Pine Script to the chart', {}, async () => {
-    try { return jsonResult(await core.compile()); }
+  server.tool('pine_compile', 'Request compilation of the current Pine Script and inspect diagnostics. An unverified status requires chart/console inspection; do not blindly retry.', {}, async () => {
+    try { const result = await core.compile(); return jsonResult(result, !result.success); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
   server.tool('pine_get_errors', 'Get Pine Script compilation errors from Monaco markers', {}, async () => {
-    try { return jsonResult(await core.getErrors()); }
+    try { const result = await core.getErrors(); return jsonResult(result, !result.success); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
@@ -35,8 +35,8 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_smart_compile', 'Intelligent compile: detects button, compiles, checks errors, reports study changes', {}, async () => {
-    try { return jsonResult(await core.smartCompile()); }
+  server.tool('pine_smart_compile', 'Request compilation, poll editor diagnostics, and report errors or an explicit unverified status. A click or an empty error list is not proof of completion.', {}, async () => {
+    try { const result = await core.smartCompile(); return jsonResult(result, !result.success); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
@@ -69,7 +69,7 @@ export function registerPineTools(server) {
   server.tool('pine_check', 'Compile Pine Script via TradingView\'s server API without needing the chart open. Returns compilation errors/warnings. Useful for validating code before injecting into the chart.', {
     source: z.string().describe('Pine Script source code to compile/validate'),
   }, async ({ source }) => {
-    try { return jsonResult(await core.check({ source })); }
+    try { const result = await core.check({ source }); return jsonResult(result, !result.success); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 }

@@ -183,11 +183,11 @@ export function analyze({ source }) {
   };
 }
 
-export async function check({ source }) {
+export async function check({ source, _deps }) {
   const formData = new URLSearchParams();
   formData.append('source', source);
 
-  const response = await fetch(
+  const response = await (_deps?.fetch || fetch)(
     'https://pine-facade.tradingview.com/pine-facade/translate_light?user_name=Guest&pine_id=00000000-0000-0000-0000-000000000000',
     {
       method: 'POST',
@@ -210,7 +210,7 @@ export async function check({ source }) {
   const inner = result?.result;
 
   if (inner) {
-    if (inner.errors2 && inner.errors2.length > 0) {
+    if (Array.isArray(inner.errors2) && inner.errors2.length > 0) {
       for (const e of inner.errors2) {
         errors.push({
           line: e.start?.line, column: e.start?.column,
@@ -219,26 +219,31 @@ export async function check({ source }) {
         });
       }
     }
-    if (inner.warnings2 && inner.warnings2.length > 0) {
+    if (Array.isArray(inner.warnings2) && inner.warnings2.length > 0) {
       for (const w of inner.warnings2) {
         warnings.push({ line: w.start?.line, column: w.start?.column, message: w.message });
       }
     }
   }
 
-  if (result.error && typeof result.error === 'string') {
+  if (result?.error && typeof result.error === 'string') {
     errors.push({ message: result.error });
   }
 
-  const compiled = errors.length === 0;
+  // An empty/unrecognized JSON response is not evidence of successful compilation.
+  // Require an explicit successful envelope AND the compiler's generated template.
+  const confirmed = result?.success === true && typeof inner?.ilTemplate === 'string' && inner.ilTemplate.length > 0;
+  const compiled = errors.length ? false : confirmed ? true : null;
   return {
-    success: true,
+    success: compiled === true,
     compiled,
+    compilation_status: compiled === true ? 'compiler_confirmed' : compiled === false ? 'compiler_errors' : 'unverified',
     error_count: errors.length,
     warning_count: warnings.length,
     errors: errors.length > 0 ? errors : undefined,
     warnings: warnings.length > 0 ? warnings : undefined,
-    note: compiled ? 'Pine Script compiled successfully.' : undefined,
+    error: compiled === null ? 'Compiler response did not contain recognized completion evidence.' : undefined,
+    note: compiled ? 'The server returned a compiled template. This does not verify application to the chart or runtime behavior.' : undefined,
   };
 }
 
@@ -281,67 +286,52 @@ export async function setSource({ source }) {
   return { success: true, lines_set: source.split('\n').length };
 }
 
-export async function compile() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
-
-  const clicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var fallback = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!fallback && /^(Add to chart|Update on chart)/i.test(text)) {
-          fallback = btns[i];
-        }
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) {
-          saveBtn = btns[i];
-        }
-      }
-      if (fallback) { fallback.click(); return fallback.textContent.trim(); }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
-    })()
-  `);
-
-  if (!clicked) {
-    const c = await getClient();
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  }
-
-  await new Promise(r => setTimeout(r, 2000));
-  return { success: true, button_clicked: clicked || 'keyboard_shortcut', source: 'dom_fallback' };
-}
-
-export async function getErrors() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
-
-  const errors = await evaluate(`
+// A click or an empty marker list does not prove compilation completed.
+// Keep dispatch, diagnostics, and compilation status separate for MCP clients.
+async function readEditorState(run = evaluate) {
+  return run(`
     (function() {
       var m = ${FIND_MONACO};
-      if (!m) return [];
+      if (!m) return { available: false, reason: 'Pine editor is unavailable.' };
       var model = m.editor.getModel();
-      if (!model) return [];
+      if (!model) return { available: false, reason: 'Pine editor model is unavailable.' };
       var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
-        return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
-      });
+      if (!Array.isArray(markers)) return { available: false, reason: 'Editor diagnostics are unavailable.' };
+      var studies = null;
+      try {
+        var chart = window.TradingViewApi._activeChartWidgetWV.value();
+        studies = chart.getAllStudies().map(function(s) { return String(s.id); });
+      } catch(e) {}
+      return {
+        available: true, model_uri: String(model.uri), model_version: model.getVersionId(),
+        study_ids: studies,
+        markers: markers.map(function(mk) {
+          return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
+        })
+      };
     })()
   `);
+}
 
-  return {
-    success: true,
-    has_errors: errors?.length > 0,
-    error_count: errors?.length || 0,
-    errors: errors || [],
-  };
+function diagnostics(state) {
+  const markers = state?.markers || [];
+  const errors = markers.filter(m => m.severity === 8);
+  const warnings = markers.filter(m => m.severity === 4);
+  return { diagnostics_available: state?.available === true, has_errors: errors.length > 0,
+    error_count: errors.length, warning_count: warnings.length, errors, warnings };
+}
+
+export async function compile(options = {}) {
+  return smartCompile(options);
+}
+
+export async function getErrors({ _deps } = {}) {
+  const ready = await (_deps?.ensurePineEditorOpen || ensurePineEditorOpen)();
+  if (!ready) return { success: false, diagnostics_available: false, has_errors: null, error: 'Pine editor is unavailable.' };
+  const state = await readEditorState(_deps?.evaluate || evaluate);
+  if (!state?.available) return { success: false, diagnostics_available: false, has_errors: null,
+    error: state?.reason || 'Editor diagnostics are unavailable.' };
+  return { success: true, ...diagnostics(state) };
 }
 
 export async function save() {
@@ -426,82 +416,58 @@ export async function getConsole() {
   return { success: true, entries: entries || [], entry_count: entries?.length || 0 };
 }
 
-export async function smartCompile() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+export async function smartCompile({ _deps } = {}) {
+  const run = _deps?.evaluate || evaluate;
+  const delay = _deps?.delay || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const ready = await (_deps?.ensurePineEditorOpen || ensurePineEditorOpen)();
+  if (!ready) throw new Error('Could not open Pine Editor.');
+  const before = await readEditorState(run);
+  if (!before?.available) return { success: false, action_dispatched: false, compiled: null,
+    compilation_status: 'diagnostics_unavailable', diagnostics_available: false, has_errors: null,
+    error: before?.reason || 'Editor diagnostics are unavailable.' };
 
-  const studiesBefore = await evaluate(`
+  const buttonClicked = await run(`
     (function() {
-      try {
-        var chart = window.TradingViewApi._activeChartWidgetWV.value();
-        if (chart && typeof chart.getAllStudies === 'function') return chart.getAllStudies().length;
-      } catch(e) {}
-      return null;
-    })()
-  `);
-
-  const buttonClicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var addBtn = null;
-      var updateBtn = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!addBtn && /^add to chart$/i.test(text)) addBtn = btns[i];
-        if (!updateBtn && /^update on chart$/i.test(text)) updateBtn = btns[i];
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) saveBtn = btns[i];
+      var btns = Array.from(document.querySelectorAll('button')).filter(function(b) {
+        return b.offsetParent !== null && !b.disabled;
+      });
+      // A plain Save button is not a compile action. Prefer Update for existing studies.
+      var patterns = [/^update on chart$/i, /^save and add to chart$/i, /^add to chart$/i];
+      for (var p of patterns) {
+        var button = btns.find(function(b) { return p.test(b.textContent.trim()); });
+        if (button) { button.click(); return button.textContent.trim(); }
       }
-      if (addBtn) { addBtn.click(); return 'Add to chart'; }
-      if (updateBtn) { updateBtn.click(); return 'Update on chart'; }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
       return null;
     })()
   `);
-
   if (!buttonClicked) {
-    const c = await getClient();
+    const c = await (_deps?.getClient || getClient)();
     await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
     await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
   }
 
-  await new Promise(r => setTimeout(r, 2500));
-
-  const errors = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return [];
-      var model = m.editor.getModel();
-      if (!model) return [];
-      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
-        return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
-      });
-    })()
-  `);
-
-  const studiesAfter = await evaluate(`
-    (function() {
-      try {
-        var chart = window.TradingViewApi._activeChartWidgetWV.value();
-        if (chart && typeof chart.getAllStudies === 'function') return chart.getAllStudies().length;
-      } catch(e) {}
-      return null;
-    })()
-  `);
-
-  const studyAdded = (studiesBefore !== null && studiesAfter !== null) ? studiesAfter > studiesBefore : null;
-
-  return {
-    success: true,
-    button_clicked: buttonClicked || 'keyboard_shortcut',
-    has_errors: errors?.length > 0,
-    errors: errors || [],
-    study_added: studyAdded,
+  const base = { success: false, action_dispatched: true, compiled: null,
+    button_clicked: buttonClicked || 'keyboard_shortcut' };
+  let state = before;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await delay(500);
+    state = await readEditorState(run);
+    if (!state?.available) continue;
+    if (state.model_uri !== before.model_uri || state.model_version !== before.model_version) return {
+      ...base, compilation_status: 'source_changed', diagnostics_available: true, has_errors: null,
+      error: 'The editor source changed during the check; the result cannot be attributed to the requested source.',
+    };
+    const report = diagnostics(state);
+    if (report.has_errors) return { ...base, ...report, compilation_status: 'editor_errors',
+      error: 'The editor reports errors. Compilation completion has not been independently verified.' };
+  }
+  if (!state?.available) return { ...base, compilation_status: 'diagnostics_unavailable',
+    diagnostics_available: false, has_errors: null, error: state?.reason || 'Editor diagnostics are unavailable.' };
+  const studyAdded = Array.isArray(before.study_ids) && Array.isArray(state.study_ids)
+    ? state.study_ids.some(id => !before.study_ids.includes(id)) : null;
+  return { ...base, ...diagnostics(state), compilation_status: 'unverified', study_added: studyAdded,
+    error: 'No editor errors observed, but compilation completion and the intended chart update are unverified.',
+    note: 'Inspect the chart and Pine console. Do not repeatedly compile solely to clear this status. Study additions alone do not identify the compiled source.',
   };
 }
 
